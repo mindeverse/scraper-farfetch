@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import sys
@@ -199,11 +198,7 @@ def _process_batch(
     stats: RunStats,
 ):
     """Process a batch of products: diff, embed, upsert."""
-    hf_headers = {}
-    if config.HF_TOKEN:
-        hf_headers["Authorization"] = f"Bearer {config.HF_TOKEN}"
-
-    with httpx.Client(headers=hf_headers, timeout=60) as hf_client:
+    with httpx.Client(headers=config.HEADERS, timeout=60) as hf_client:
         for product in products:
             url = product["product_url"]
             try:
@@ -230,7 +225,7 @@ def _process_batch(
                 # Generate embeddings
                 if do_front_embed and new_image_url:
                     embedding = generate_image_embedding(
-                        new_image_url, config.HF_TOKEN, hf_client, config.EMBEDDING_DELAY
+                        new_image_url, config.HF_TOKEN, hf_client, cfg=config
                     )
                     if embedding:
                         product["_image_embedding"] = embedding
@@ -241,7 +236,7 @@ def _process_batch(
 
                 if do_back_embed and new_back_url:
                     back_embedding = generate_image_embedding(
-                        new_back_url, config.HF_TOKEN, hf_client, config.EMBEDDING_DELAY
+                        new_back_url, config.HF_TOKEN, hf_client, cfg=config
                     )
                     if back_embedding:
                         product["_back_image_embedding"] = back_embedding
@@ -253,7 +248,7 @@ def _process_batch(
                     info_text = build_info_text(product)
                     if info_text:
                         info_embedding = generate_text_embedding(
-                            info_text, config.HF_TOKEN, hf_client, config.EMBEDDING_DELAY
+                            info_text, config.HF_TOKEN, hf_client, cfg=config
                         )
                         if info_embedding:
                             product["_info_embedding"] = info_embedding

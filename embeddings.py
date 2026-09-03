@@ -1,44 +1,86 @@
+from __future__ import annotations
+
 import base64
 import io
 import logging
 import time
-import math
 from typing import Optional
 
 import httpx
 from PIL import Image
 
+from config import Config
+
 logger = logging.getLogger(__name__)
 
-SIGLIP_API_URL = "https://api-inference.huggingface.co/models/google/siglip-base-patch16-384"
-GEMINI_EMBED_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+_last_hf_call: float = 0.0
 
 
-def _l2_normalize(vector: list[float]) -> list[float]:
-    """L2-normalize a vector."""
-    norm = math.sqrt(sum(x * x for x in vector))
-    if norm == 0:
-        return vector
-    return [x / norm for x in vector]
+def _rate_limit(cfg: Config) -> None:
+    global _last_hf_call
+    elapsed = time.time() - _last_hf_call
+    if elapsed < cfg.EMBEDDING_DELAY:
+        time.sleep(cfg.EMBEDDING_DELAY - elapsed)
+    _last_hf_call = time.time()
 
 
-def _prepare_image(image_bytes: bytes) -> bytes:
-    """
-    Decode image, resize longest side to 1280px, encode as JPEG quality 85.
-    Returns JPEG bytes.
-    """
-    img = Image.open(io.BytesIO(image_bytes))
-    img = img.convert("RGB")
+def _download_image(url: str, client: httpx.Client) -> bytes | None:
+    try:
+        resp = client.get(url, timeout=15)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        logger.error("Failed to download image %s: %s", url, e)
+        return None
 
-    max_side = max(img.size)
-    if max_side > 1280:
-        ratio = 1280 / max_side
-        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
-        img = img.resize(new_size, Image.LANCZOS)
 
+def _process_image(image_bytes: bytes, max_side: int = 1280) -> str:
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_side:
+        ratio = max_side / max(w, h)
+        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _call_hf_api(payload: dict, cfg: Config) -> list[float] | None:
+    url = f"https://api-inference.huggingface.co/models/{cfg.SIGLIP_MODEL}"
+    headers = {}
+    if cfg.HF_TOKEN:
+        headers["Authorization"] = f"Bearer {cfg.HF_TOKEN}"
+    for attempt in range(cfg.MAX_RETRIES):
+        try:
+            _rate_limit(cfg)
+            resp = httpx.post(url, json=payload, headers=headers, timeout=60)
+            if resp.status_code == 503:
+                time.sleep(5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            result = resp.json()
+            if isinstance(result, list) and len(result) > 0:
+                embedding = result[0] if isinstance(result[0], list) else result
+                if isinstance(embedding, list) and len(embedding) == cfg.SIGLIP_DIM:
+                    return embedding
+                if isinstance(embedding, list) and len(embedding) > cfg.SIGLIP_DIM:
+                    return embedding[:cfg.SIGLIP_DIM]
+            logger.warning("Unexpected HF response shape: %s", type(result))
+            return None
+        except httpx.HTTPStatusError as e:
+            logger.error("HF API error (attempt %d/%d): %s", attempt + 1, cfg.MAX_RETRIES, e)
+            time.sleep(2 ** (attempt + 1))
+        except Exception as e:
+            logger.error("HF API call failed (attempt %d/%d): %s", attempt + 1, cfg.MAX_RETRIES, e)
+            time.sleep(2 ** (attempt + 1))
+    return None
+
+
+def _l2_normalize(vec: list[float]) -> list[float]:
+    norm = sum(v * v for v in vec) ** 0.5
+    if norm < 1e-9:
+        return vec
+    return [v / norm for v in vec]
 
 
 def generate_image_embedding(
@@ -46,56 +88,29 @@ def generate_image_embedding(
     hf_token: str,
     client: httpx.Client,
     delay: float = 0.5,
+    cfg: Config | None = None,
 ) -> Optional[list[float]]:
     """Download image and generate SigLIP embedding via HuggingFace Inference API."""
-    try:
-        # Download image
-        resp = client.get(image_url, timeout=30)
-        resp.raise_for_status()
+    if cfg is None:
+        cfg = Config()
 
-        # Prepare image
-        jpeg_bytes = _prepare_image(resp.content)
-        b64_image = base64.b64encode(jpeg_bytes).decode("utf-8")
-
-        # Call HF API
-        headers = {}
-        if hf_token:
-            headers["Authorization"] = f"Bearer {hf_token}"
-
-        payload = {
-            "inputs": {
-                "image": b64_image,
-            },
-        }
-
-        time.sleep(delay)
-        resp = client.post(
-            SIGLIP_API_URL,
-            json=payload,
-            headers=headers,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Handle different response formats
-        embedding = _extract_embedding(data)
-        if embedding is None:
-            logger.warning("No embedding returned for image %s", image_url)
-            return None
-
-        # L2-normalize
-        embedding = _l2_normalize(embedding)
-
-        if len(embedding) != 768:
-            logger.warning("Embedding dim %d != 768 for %s", len(embedding), image_url)
-            return None
-
-        return embedding
-
-    except Exception as e:
-        logger.error("Failed to generate image embedding for %s: %s", image_url, e)
+    image_bytes = _download_image(image_url, client)
+    if not image_bytes:
         return None
+
+    image_b64 = _process_image(image_bytes)
+    payload = {
+        "inputs": {
+            "image": f"data:image/jpeg;base64,{image_b64}"
+        },
+        "options": {"wait_for_model": True}
+    }
+
+    embedding = _call_hf_api(payload, cfg)
+    if embedding is None:
+        return None
+
+    return _l2_normalize(embedding)
 
 
 def generate_text_embedding(
@@ -103,74 +118,25 @@ def generate_text_embedding(
     hf_token: str,
     client: httpx.Client,
     delay: float = 0.5,
+    cfg: Config | None = None,
 ) -> Optional[list[float]]:
-    """Generate text embedding using sentence-transformers via HuggingFace API."""
-    try:
-        if not text or not text.strip():
-            return None
+    """Generate text embedding using SigLIP via HuggingFace API."""
+    if cfg is None:
+        cfg = Config()
 
-        headers = {}
-        if hf_token:
-            headers["Authorization"] = f"Bearer {hf_token}"
-
-        payload = {"inputs": text}
-
-        time.sleep(delay)
-        resp = client.post(
-            GEMINI_EMBED_URL,
-            json=payload,
-            headers=headers,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        embedding = _extract_embedding(data)
-        if embedding is None:
-            logger.warning("No text embedding returned")
-            return None
-
-        embedding = _l2_normalize(embedding)
-
-        if len(embedding) != 768:
-            logger.warning("Text embedding dim %d != 768", len(embedding))
-            return None
-
-        return embedding
-
-    except Exception as e:
-        logger.error("Failed to generate text embedding: %s", e)
+    if not text or not text.strip():
         return None
 
+    payload = {
+        "inputs": text[:512],
+        "options": {"wait_for_model": True}
+    }
 
-def _extract_embedding(data) -> Optional[list[float]]:
-    """Extract embedding vector from various HF API response formats."""
-    if isinstance(data, list):
-        # Could be batch format: [[...]] or flat: [...]
-        if len(data) > 0:
-            if isinstance(data[0], list):
-                # Nested - average if batch
-                if len(data) == 1:
-                    return data[0]
-                # Average across batch
-                dim = len(data[0])
-                avg = [0.0] * dim
-                for vec in data:
-                    for i in range(dim):
-                        avg[i] += vec[i]
-                return [x / len(data) for x in avg]
-            else:
-                # Flat 768-d vector
-                return data
+    embedding = _call_hf_api(payload, cfg)
+    if embedding is None:
+        return None
 
-    elif isinstance(data, dict):
-        # Could be {"embeddings": [...]} or {"vector": [...]}
-        for key in ["embeddings", "vector", "embedding", "data"]:
-            if key in data:
-                val = data[key]
-                return _extract_embedding(val)
-
-    return None
+    return _l2_normalize(embedding)
 
 
 def build_info_text(product: dict) -> str:
