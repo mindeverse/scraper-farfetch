@@ -30,11 +30,14 @@ class Config:
     EMBEDDING_DELAY: float = 0.5
 
     # Scraping
-    REQUEST_DELAY: float = 0.8
+    REQUEST_DELAY: float = 1.5
+    DETAIL_DELAY: float = 2.0
     MAX_RETRIES: int = 3
     BATCH_SIZE: int = 50
     ITEMS_PER_PAGE: int = 96
     STALE_MISS_THRESHOLD: int = 2
+    DETAIL_RETRY_ATTEMPTS: int = 3
+    DETAIL_RETRY_BASE_WAIT: float = 30.0
 
     # HTTP
     BASE_URL: str = "https://www.farfetch.com"

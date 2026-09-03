@@ -14,6 +14,22 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 _last_hf_call: float = 0.0
+_hf_reachable: bool | None = None  # None = unknown
+
+
+def is_hf_reachable() -> bool:
+    """Check if HF API is reachable (cached after first check)."""
+    global _hf_reachable
+    if _hf_reachable is not None:
+        return _hf_reachable
+    try:
+        resp = httpx.head("https://api-inference.huggingface.co", timeout=10)
+        _hf_reachable = resp.status_code < 500
+    except Exception:
+        _hf_reachable = False
+    if not _hf_reachable:
+        logger.warning("HuggingFace API is not reachable — embeddings will be skipped")
+    return _hf_reachable
 
 
 def _rate_limit(cfg: Config) -> None:
@@ -71,8 +87,10 @@ def _call_hf_api(payload: dict, cfg: Config) -> list[float] | None:
             logger.error("HF API error (attempt %d/%d): %s", attempt + 1, cfg.MAX_RETRIES, e)
             time.sleep(2 ** (attempt + 1))
         except Exception as e:
-            logger.error("HF API call failed (attempt %d/%d): %s", attempt + 1, cfg.MAX_RETRIES, e)
-            time.sleep(2 ** (attempt + 1))
+            global _hf_reachable
+            _hf_reachable = False
+            logger.warning("HF API unreachable (attempt %d/%d): %s — skipping embeddings", attempt + 1, cfg.MAX_RETRIES, e)
+            return None
     return None
 
 
