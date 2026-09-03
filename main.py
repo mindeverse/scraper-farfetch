@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -64,11 +65,32 @@ def scrape_category(
 
     while True:
         logger.info("Fetching category page %d: %s", page, url)
-        try:
-            resp = client.get(url, timeout=30)
-            resp.raise_for_status()
-        except Exception as e:
-            logger.error("Failed to fetch %s: %s", url, e)
+        resp = None
+        for attempt in range(config.DETAIL_RETRY_ATTEMPTS):
+            try:
+                resp = client.get(url, timeout=30)
+                if resp.status_code == 429:
+                    wait = config.DETAIL_RETRY_BASE_WAIT * (attempt + 1)
+                    logger.warning("429 on category page, waiting %.0fs (attempt %d/%d)",
+                        wait, attempt + 1, config.DETAIL_RETRY_ATTEMPTS)
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                break
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    wait = config.DETAIL_RETRY_BASE_WAIT * (attempt + 1)
+                    logger.warning("429 on category page, waiting %.0fs (attempt %d/%d)",
+                        wait, attempt + 1, config.DETAIL_RETRY_ATTEMPTS)
+                    time.sleep(wait)
+                    continue
+                logger.error("Failed to fetch %s: %s", url, e)
+                return products
+            except Exception as e:
+                logger.error("Failed to fetch %s: %s", url, e)
+                return products
+        if resp is None or resp.status_code >= 400:
+            logger.error("Failed to fetch %s after retries", url)
             break
 
         html = resp.text
@@ -91,7 +113,7 @@ def scrape_category(
 
         page += 1
         url = f"{category_url}?page={page}"
-        time.sleep(config.REQUEST_DELAY)
+        time.sleep(config.REQUEST_DELAY + random.uniform(0, 1))
 
     return products
 
@@ -180,7 +202,7 @@ def run():
                     detail[key] = listing_data[key]
 
             products_to_upsert.append(detail)
-            time.sleep(config.DETAIL_DELAY)
+            time.sleep(config.DETAIL_DELAY + random.uniform(0, 2))
 
             # Batch upsert every BATCH_SIZE products
             if len(products_to_upsert) >= config.BATCH_SIZE:

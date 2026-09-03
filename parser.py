@@ -252,11 +252,13 @@ def _parse_product_edge(edge: dict, apollo: dict, gender: str) -> dict | None:
     }
 
 
-def parse_listing_products(hydration: dict) -> tuple[list[dict], dict | None]:
+def parse_listing_products(hydration: dict | None) -> tuple[list[dict], dict | None]:
     """
     Parse product catalog from listing page hydration state.
     Returns (list of product summaries, pagination info).
     """
+    if not hydration:
+        return [], None
     apollo = hydration.get("apolloInitialState", {})
     products = []
     pagination = None
