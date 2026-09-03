@@ -1,160 +1,139 @@
-from __future__ import annotations
+"""Image and text embeddings using SigLIP (768-dim).
 
-import base64
+Runs the model locally via transformers + torch — no HF API token needed.
+Model: google/siglip-base-patch16-384 (free on HuggingFace).
+"""
+
 import io
 import logging
-import time
+import math
 from typing import Optional
 
 import httpx
+import torch
 from PIL import Image
+
+try:
+    from transformers import SiglipImageProcessorPil as SiglipImageProcessor
+except ImportError:
+    from transformers import SiglipImageProcessor
+from transformers import SiglipModel, SiglipTokenizer
 
 from config import Config
 
 logger = logging.getLogger(__name__)
 
-_last_hf_call: float = 0.0
-_hf_reachable: bool | None = None  # None = unknown
+MODEL_NAME = "google/siglip-base-patch16-384"
+
+_model = None
+_image_processor = None
+_tokenizer = None
+_device = None
 
 
-def is_hf_reachable() -> bool:
-    """Check if HF API is reachable (cached after first check)."""
-    global _hf_reachable
-    if _hf_reachable is not None:
-        return _hf_reachable
-    try:
-        resp = httpx.head("https://api-inference.huggingface.co", timeout=10)
-        _hf_reachable = resp.status_code < 500
-    except Exception:
-        _hf_reachable = False
-    if not _hf_reachable:
-        logger.warning("HuggingFace API is not reachable — embeddings will be skipped")
-    return _hf_reachable
+def _get_device():
+    global _device
+    if _device is None:
+        if torch.cuda.is_available():
+            _device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            _device = "mps"
+        else:
+            _device = "cpu"
+    return _device
 
 
-def _rate_limit(cfg: Config) -> None:
-    global _last_hf_call
-    elapsed = time.time() - _last_hf_call
-    if elapsed < cfg.EMBEDDING_DELAY:
-        time.sleep(cfg.EMBEDDING_DELAY - elapsed)
-    _last_hf_call = time.time()
+def _load_model():
+    global _model, _image_processor, _tokenizer
+    if _model is None:
+        logger.info("Loading SigLIP model %s...", MODEL_NAME)
+        _image_processor = SiglipImageProcessor.from_pretrained(MODEL_NAME)
+        _tokenizer = SiglipTokenizer.from_pretrained(MODEL_NAME)
+        _model = SiglipModel.from_pretrained(MODEL_NAME)
+        _model.to(_get_device())
+        _model.eval()
+        logger.info("SigLIP model loaded on %s", _get_device())
+    return _model, _image_processor, _tokenizer
 
 
-def _download_image(url: str, client: httpx.Client) -> bytes | None:
-    try:
-        resp = client.get(url, timeout=15)
-        resp.raise_for_status()
-        return resp.content
-    except Exception as e:
-        logger.error("Failed to download image %s: %s", url, e)
-        return None
+def _l2_normalize(vector: list[float]) -> list[float]:
+    norm = math.sqrt(sum(v * v for v in vector))
+    if norm < 1e-10:
+        return vector
+    return [v / norm for v in vector]
 
 
-def _process_image(image_bytes: bytes, max_side: int = 1280) -> str:
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    w, h = img.size
-    if max(w, h) > max_side:
-        ratio = max_side / max(w, h)
-        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
-
-
-def _call_hf_api(payload: dict, cfg: Config) -> list[float] | None:
-    url = f"https://api-inference.huggingface.co/models/{cfg.SIGLIP_MODEL}"
-    headers = {}
-    if cfg.HF_TOKEN:
-        headers["Authorization"] = f"Bearer {cfg.HF_TOKEN}"
-    for attempt in range(cfg.MAX_RETRIES):
-        try:
-            _rate_limit(cfg)
-            resp = httpx.post(url, json=payload, headers=headers, timeout=60)
-            if resp.status_code == 503:
-                time.sleep(5 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            result = resp.json()
-            if isinstance(result, list) and len(result) > 0:
-                embedding = result[0] if isinstance(result[0], list) else result
-                if isinstance(embedding, list) and len(embedding) == cfg.SIGLIP_DIM:
-                    return embedding
-                if isinstance(embedding, list) and len(embedding) > cfg.SIGLIP_DIM:
-                    return embedding[:cfg.SIGLIP_DIM]
-            logger.warning("Unexpected HF response shape: %s", type(result))
-            return None
-        except httpx.HTTPStatusError as e:
-            logger.error("HF API error (attempt %d/%d): %s", attempt + 1, cfg.MAX_RETRIES, e)
-            time.sleep(2 ** (attempt + 1))
-        except Exception as e:
-            global _hf_reachable
-            _hf_reachable = False
-            logger.warning("HF API unreachable (attempt %d/%d): %s — skipping embeddings", attempt + 1, cfg.MAX_RETRIES, e)
-            return None
-    return None
-
-
-def _l2_normalize(vec: list[float]) -> list[float]:
-    norm = sum(v * v for v in vec) ** 0.5
-    if norm < 1e-9:
-        return vec
-    return [v / norm for v in vec]
-
-
-def generate_image_embedding(
-    image_url: str,
-    hf_token: str,
-    client: httpx.Client,
-    delay: float = 0.5,
-    cfg: Config | None = None,
-) -> Optional[list[float]]:
-    """Download image and generate SigLIP embedding via HuggingFace Inference API."""
-    if cfg is None:
-        cfg = Config()
-
-    image_bytes = _download_image(image_url, client)
-    if not image_bytes:
-        return None
-
-    image_b64 = _process_image(image_bytes)
-    payload = {
-        "inputs": {
-            "image": f"data:image/jpeg;base64,{image_b64}"
-        },
-        "options": {"wait_for_model": True}
+def get_image_embedding(image_url: str) -> Optional[list[float]]:
+    """Generate 768-dim L2-normalized embedding for an image using SigLIP."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
-
-    embedding = _call_hf_api(payload, cfg)
-    if embedding is None:
+    try:
+        resp = httpx.get(image_url, timeout=15, headers=headers)
+        resp.raise_for_status()
+        image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+    except Exception as e:
+        logger.warning("Failed to load image %s: %s", image_url, e)
         return None
 
-    return _l2_normalize(embedding)
+    model, image_processor, _ = _load_model()
+    device = _get_device()
+
+    try:
+        inputs = image_processor(images=image, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.get_image_features(**inputs)
+
+        emb_tensor = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
+        embedding = emb_tensor.cpu().float().numpy().flatten().tolist()
+
+        if len(embedding) != 768:
+            logger.warning("Unexpected embedding dim %d", len(embedding))
+            return None
+
+        return _l2_normalize(embedding)
+
+    except Exception as e:
+        logger.warning("Failed to embed image: %s", e)
+        return None
 
 
-def generate_text_embedding(
-    text: str,
-    hf_token: str,
-    client: httpx.Client,
-    delay: float = 0.5,
-    cfg: Config | None = None,
-) -> Optional[list[float]]:
-    """Generate text embedding using SigLIP via HuggingFace API."""
-    if cfg is None:
-        cfg = Config()
-
+def get_text_embedding(text: str) -> Optional[list[float]]:
+    """Generate 768-dim L2-normalized embedding for text using SigLIP text encoder."""
     if not text or not text.strip():
         return None
 
-    payload = {
-        "inputs": text[:512],
-        "options": {"wait_for_model": True}
-    }
+    model, _, tokenizer = _load_model()
+    device = _get_device()
 
-    embedding = _call_hf_api(payload, cfg)
-    if embedding is None:
+    try:
+        inputs = tokenizer(
+            text=[text],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=64,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.get_text_features(**inputs)
+
+        emb_tensor = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
+        embedding = emb_tensor.cpu().float().numpy().flatten().tolist()
+
+        if len(embedding) != 768:
+            logger.warning("Unexpected text embedding dim %d", len(embedding))
+            return None
+
+        return _l2_normalize(embedding)
+
+    except Exception as e:
+        logger.warning("Failed to embed text: %s", e)
         return None
-
-    return _l2_normalize(embedding)
 
 
 def build_info_text(product: dict) -> str:

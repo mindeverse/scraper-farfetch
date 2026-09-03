@@ -28,7 +28,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python main.py
 
       - name: Upload failed products log

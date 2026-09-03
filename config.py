@@ -21,13 +21,9 @@ class Config:
     SUPABASE_URL: str = field(default_factory=lambda: os.environ["SUPABASE_URL"])
     SUPABASE_KEY: str = field(default_factory=lambda: os.environ["SUPABASE_KEY"])
 
-    # HuggingFace
-    HF_TOKEN: str = field(default_factory=lambda: os.environ.get("HF_TOKEN", ""))
+    # Embeddings (local SigLIP, no API token needed)
     SIGLIP_MODEL: str = "google/siglip-base-patch16-384"
     SIGLIP_DIM: int = 768
-
-    # Embedding rate limit (seconds between HF API calls)
-    EMBEDDING_DELAY: float = 0.5
 
     # Scraping
     REQUEST_DELAY: float = 1.5

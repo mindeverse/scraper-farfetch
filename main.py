@@ -3,7 +3,7 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -17,13 +17,11 @@ from parser import (
     extract_hydration_state,
     parse_listing_products,
     parse_product_detail,
-    build_product_id,
 )
 from embeddings import (
-    generate_image_embedding,
-    generate_text_embedding,
+    get_image_embedding,
+    get_text_embedding,
     build_info_text,
-    is_hf_reachable,
 )
 from supabase_client import SupabaseClient
 
@@ -241,8 +239,7 @@ def _process_batch(
     stats: RunStats,
 ):
     """Process a batch of products: diff, embed, upsert."""
-    hf_ok = is_hf_reachable() if config.HF_TOKEN else False
-    with httpx.Client(headers=config.HEADERS, timeout=60) as hf_client:
+    with httpx.Client(timeout=60) as hf_client:
         for product in products:
             url = product["product_url"]
             try:
@@ -262,24 +259,20 @@ def _process_batch(
                 # Determine what needs re-embedding
                 new_image_url = product.get("image_url", "")
                 new_back_url = product.get("back_image_url")
-                do_front_embed = hf_ok and sb.needs_image_reembed(url, new_image_url)
-                do_back_embed = hf_ok and sb.needs_back_reembed(url, new_back_url)
-                do_info_embed = hf_ok and sb.needs_info_reembed(url, product)
+                do_front_embed = sb.needs_image_reembed(url, new_image_url)
+                do_back_embed = sb.needs_back_reembed(url, new_back_url)
+                do_info_embed = sb.needs_info_reembed(url, product)
 
-                # Generate embeddings
+                # Generate embeddings (local SigLIP, no API token needed)
                 if do_front_embed and new_image_url:
-                    embedding = generate_image_embedding(
-                        new_image_url, config.HF_TOKEN, hf_client, cfg=config
-                    )
+                    embedding = get_image_embedding(new_image_url)
                     if embedding:
                         product["_image_embedding"] = embedding
                         product["_embedding_version"] = 2
                         stats.front_embeddings += 1
 
                 if do_back_embed and new_back_url:
-                    back_embedding = generate_image_embedding(
-                        new_back_url, config.HF_TOKEN, hf_client, cfg=config
-                    )
+                    back_embedding = get_image_embedding(new_back_url)
                     if back_embedding:
                         product["_back_image_embedding"] = back_embedding
                         stats.back_embeddings += 1
@@ -287,9 +280,7 @@ def _process_batch(
                 if do_info_embed:
                     info_text = build_info_text(product)
                     if info_text:
-                        info_embedding = generate_text_embedding(
-                            info_text, config.HF_TOKEN, hf_client, cfg=config
-                        )
+                        info_embedding = get_text_embedding(info_text)
                         if info_embedding:
                             product["_info_embedding"] = info_embedding
                             stats.text_embeddings += 1
